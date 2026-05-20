@@ -19,7 +19,9 @@ struct RadixSortTemp {
 };
 
 // use unique temp buffers per CUDA stream to avoid race conditions
-static std::unordered_map<void*, RadixSortTemp> g_radix_sort_temp_map;
+// thread_local so concurrent host threads (e.g. DataLoader workers)
+// don't corrupt the map with unsynchronised mutations.
+static thread_local std::unordered_map<void*, RadixSortTemp> g_radix_sort_temp_map;
 
 
 template <typename KeyType> void radix_sort_reserve_internal(void* context, int n, void** mem_out, size_t* size_out)

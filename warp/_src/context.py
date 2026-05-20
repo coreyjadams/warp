@@ -2566,6 +2566,7 @@ class Module:
 
         # executable modules currently loaded
         self.execs = {}  # ((device.context, blockdim): ModuleExec)
+        self._load_lock = threading.RLock()
 
         # set of device contexts where the build has failed
         self.failed_builds = set()
@@ -3196,98 +3197,108 @@ class Module:
                 new_str = current_hash.hex()[:8] if current_hash else "None"
                 log_debug(f"[Module.load] Module hash changed, recompiling: {self.name} ({old_str} -> {new_str})")
 
-        # quietly avoid repeated build attempts to reduce error spew
-        if device.context in self.failed_builds:
-            return None
+        # Slow path — serialize compile + load across threads
+        with self._load_lock:
+            # Double-check after acquiring the lock: another thread may
+            # have completed the load while we were waiting.
+            exec = self.execs.get((device.context, active_block_dim))
+            if exec is not None:
+                current_hash = self.get_module_hash(active_block_dim)
+                if self.options["strip_hash"] or (exec.module_hash == current_hash):
+                    return exec
 
-        module_hash = self.get_module_hash(active_block_dim)
-        options = self.resolved_options[active_block_dim]
+            # quietly avoid repeated build attempts to reduce error spew
+            if device.context in self.failed_builds:
+                return None
 
-        # use a unique module path using the module short hash
-        module_name_short = self.get_module_identifier(active_block_dim)
+            module_hash = self.get_module_hash(active_block_dim)
+            options = self.resolved_options[active_block_dim]
 
-        module_load_timer_name = (
-            f"Module {self.name} {module_hash.hex()[:7]} load on device '{device}'"
-            if self.options["strip_hash"] is False
-            else f"Module {self.name} load on device '{device}'"
-        )
+            # use a unique module path using the module short hash
+            module_name_short = self.get_module_identifier(active_block_dim)
 
-        if warp.config.verbose or warp.config.log_level <= warp.LOG_DEBUG:
-            module_load_timer_name += f" (block_dim={active_block_dim})"
+            module_load_timer_name = (
+                f"Module {self.name} {module_hash.hex()[:7]} load on device '{device}'"
+                if self.options["strip_hash"] is False
+                else f"Module {self.name} load on device '{device}'"
+            )
 
-        with warp.ScopedTimer(
-            module_load_timer_name,
-            active=not warp.config.quiet and warp.config.log_level <= warp.LOG_INFO,
-        ) as module_load_timer:
-            # -----------------------------------------------------------
-            # Determine binary path and build if necessary
+            if warp.config.verbose or warp.config.log_level <= warp.LOG_DEBUG:
+                module_load_timer_name += f" (block_dim={active_block_dim})"
 
-            if binary_path:
-                # We will never re-codegen or re-compile in this situation
-                # The expected files must already exist
+            with warp.ScopedTimer(
+                module_load_timer_name,
+                active=not warp.config.quiet and warp.config.log_level <= warp.LOG_INFO,
+            ) as module_load_timer:
+                # -----------------------------------------------------------
+                # Determine binary path and build if necessary
 
-                if device.is_cuda and output_arch is None:
-                    raise ValueError("'output_arch' must be provided if a 'binary_path' is provided")
+                if binary_path:
+                    # We will never re-codegen or re-compile in this situation
+                    # The expected files must already exist
 
-                if meta_path is None:
-                    raise ValueError("'meta_path' must be provided if a 'binary_path' is provided")
+                    if device.is_cuda and output_arch is None:
+                        raise ValueError("'output_arch' must be provided if a 'binary_path' is provided")
 
-                if not os.path.exists(binary_path):
-                    module_load_timer.extra_msg = " (error)"
-                    raise FileNotFoundError(f"Binary file {binary_path} does not exist")
+                    if meta_path is None:
+                        raise ValueError("'meta_path' must be provided if a 'binary_path' is provided")
+
+                    if not os.path.exists(binary_path):
+                        module_load_timer.extra_msg = " (error)"
+                        raise FileNotFoundError(f"Binary file {binary_path} does not exist")
+                    else:
+                        module_load_timer.extra_msg = " (cached)"
                 else:
-                    module_load_timer.extra_msg = " (cached)"
-            else:
-                output_name = self._get_compile_output_name(device)
-                output_arch = self._get_compile_arch(device)
+                    output_name = self._get_compile_output_name(device)
+                    output_arch = self._get_compile_arch(device)
 
-                module_dir = os.path.join(warp.config.kernel_cache_dir, module_name_short)
-                meta_path = os.path.join(module_dir, self._get_meta_name())
-                binary_path = os.path.join(module_dir, output_name)
+                    module_dir = os.path.join(warp.config.kernel_cache_dir, module_name_short)
+                    meta_path = os.path.join(module_dir, self._get_meta_name())
+                    binary_path = os.path.join(module_dir, output_name)
 
-                try:
-                    compiled = self._compile(device, module_dir, output_name, output_arch, options=options)
-                except Exception as e:
-                    module_load_timer.extra_msg = " (error)"
-                    raise e
+                    try:
+                        compiled = self._compile(device, module_dir, output_name, output_arch, options=options)
+                    except Exception as e:
+                        module_load_timer.extra_msg = " (error)"
+                        raise e
 
-                module_load_timer.extra_msg = " (compiled)" if compiled else " (cached)"
+                    module_load_timer.extra_msg = " (compiled)" if compiled else " (cached)"
 
-            # -----------------------------------------------------------
-            # Load CPU or CUDA binary
+                # -----------------------------------------------------------
+                # Load CPU or CUDA binary
 
-            if os.path.exists(meta_path):
-                with open(meta_path) as meta_file:
-                    meta = json.load(meta_file)
-            else:
-                raise FileNotFoundError(f"Module metadata file {meta_path} was not found in the cache")
-
-            if device.is_cpu:
-                # LLVM modules are identified using strings, so we need to ensure uniqueness
-                id = self.increment_id()
-                module_handle = f"wp_{self.name}_{id}"
-                if (
-                    runtime.llvm.wp_load_obj(
-                        binary_path.encode("utf-8"),
-                        module_handle.encode("utf-8"),
-                        warp.config.legacy_cpu_linker,
-                    )
-                    != 0
-                ):
-                    raise Exception(f"Failed to load CPU module '{self.name}'")
-                module_exec = ModuleExec(module_handle, module_hash, device, meta)
-                self.execs[(None, active_block_dim)] = module_exec
-
-            elif device.is_cuda:
-                cuda_module = warp._src.build.load_cuda(binary_path, device)
-                if cuda_module is not None:
-                    module_exec = ModuleExec(cuda_module, module_hash, device, meta)
-                    self.execs[(device.context, active_block_dim)] = module_exec
+                if os.path.exists(meta_path):
+                    with open(meta_path) as meta_file:
+                        meta = json.load(meta_file)
                 else:
-                    module_load_timer.extra_msg = " (error)"
-                    raise Exception(f"Failed to load CUDA module '{self.name}'")
+                    raise FileNotFoundError(f"Module metadata file {meta_path} was not found in the cache")
 
-        return module_exec
+                if device.is_cpu:
+                    # LLVM modules are identified using strings, so we need to ensure uniqueness
+                    id = self.increment_id()
+                    module_handle = f"wp_{self.name}_{id}"
+                    if (
+                        runtime.llvm.wp_load_obj(
+                            binary_path.encode("utf-8"),
+                            module_handle.encode("utf-8"),
+                            warp.config.legacy_cpu_linker,
+                        )
+                        != 0
+                    ):
+                        raise Exception(f"Failed to load CPU module '{self.name}'")
+                    module_exec = ModuleExec(module_handle, module_hash, device, meta)
+                    self.execs[(None, active_block_dim)] = module_exec
+
+                elif device.is_cuda:
+                    cuda_module = warp._src.build.load_cuda(binary_path, device)
+                    if cuda_module is not None:
+                        module_exec = ModuleExec(cuda_module, module_hash, device, meta)
+                        self.execs[(device.context, active_block_dim)] = module_exec
+                    else:
+                        module_load_timer.extra_msg = " (error)"
+                        raise Exception(f"Failed to load CUDA module '{self.name}'")
+
+            return module_exec
 
     def unload(self):
         # force rehashing on next load
@@ -3799,6 +3810,17 @@ class Stream:
         return runtime.core.wp_cuda_stream_get_priority(self.cuda_stream)
 
 
+# Thread-local storage for the current stream on each device.
+# Each thread sees its own {device_ordinal: Stream} mapping, so
+# ScopedStream save/restore does not race across threads.
+_thread_local_stream = threading.local()
+
+# Thread-local storage for the default device.
+# ScopedDevice save/restore uses this so concurrent threads
+# don't stomp each other's default device.
+_thread_local_device = threading.local()
+
+
 class Device:
     """A device to allocate Warp arrays and to launch kernels on.
 
@@ -3964,7 +3986,9 @@ class Device:
     def _init_streams(self):
         """Initialize the device's current stream and the device's null stream."""
         # create a stream for asynchronous work
-        self.set_stream(Stream(self))
+        default_stream = Stream(self)
+        self._stream = default_stream
+        self.set_stream(default_stream)
 
         # CUDA default stream for some synchronous operations
         self.null_stream = Stream(self, cuda_stream=None)
@@ -4018,10 +4042,19 @@ class Device:
     def stream(self) -> Stream:
         """The stream associated with a CUDA device.
 
+        Returns the calling thread's current stream for this device if one
+        has been set via :meth:`set_stream` or :class:`warp.ScopedStream`,
+        otherwise returns the device-wide default stream.
+
         Raises:
             RuntimeError: The device is not a CUDA device.
         """
         if self.context:
+            thread_local_stream = getattr(_thread_local_stream, "streams", None)
+            if thread_local_stream is not None:
+                stream = thread_local_stream.get(self.ordinal)
+                if stream is not None:
+                    return stream
             return self._stream
         else:
             raise RuntimeError(f"Device {self} is not a CUDA device")
@@ -4034,7 +4067,9 @@ class Device:
         """Set the current stream for this CUDA device.
 
         The current stream will be used by default for all kernel launches and
-        memory operations on this device.
+        memory operations on this device.  The stream is stored per-thread so
+        that concurrent :class:`warp.ScopedStream` usage from multiple host
+        threads does not race.
 
         If this is an external stream, the caller is responsible for
         guaranteeing the lifetime of the stream.
@@ -4051,7 +4086,9 @@ class Device:
                 raise RuntimeError(f"Stream from device {stream.device} cannot be used on device {self}")
 
             self.runtime.core.wp_cuda_context_set_stream(self.context, stream.cuda_stream, int(sync))
-            self._stream = stream
+            if not hasattr(_thread_local_stream, "streams"):
+                _thread_local_stream.streams = {}
+            _thread_local_stream.streams[self.ordinal] = stream
         else:
             raise RuntimeError(f"Device {self} is not a CUDA device")
 
@@ -4518,6 +4555,8 @@ class Runtime:
                 "Please use Warp 1.9.x or earlier for Intel Mac support, "
                 "or upgrade to Apple Silicon hardware (ARM64)."
             )
+
+        self._default_device = None
 
         if warp.config.quiet:
             if not warp.config._deprecated_quiet_warning_seen:
@@ -6352,8 +6391,24 @@ class Runtime:
 
         raise ValueError(f"Invalid device identifier: {ident}")
 
+    @property
+    def default_device(self) -> "Device":
+        """The current thread's default device, falling back to the process-wide default."""
+        thread_local_device = getattr(_thread_local_device, "device", None)
+        if thread_local_device is not None:
+            return thread_local_device
+        return self._default_device
+
+    @default_device.setter
+    def default_device(self, device: "Device") -> None:
+        if not hasattr(_thread_local_device, "device"):
+            _thread_local_device.device = None
+        _thread_local_device.device = device
+
     def set_default_device(self, ident: DeviceLike) -> None:
-        self.default_device = self.get_device(ident)
+        device = self.get_device(ident)
+        self._default_device = device
+        self.default_device = device
 
     def get_current_cuda_device(self) -> Device:
         current_context = self.core.wp_cuda_context_get_current()

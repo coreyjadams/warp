@@ -158,7 +158,10 @@ struct DeviceInfo {
 struct ContextInfo {
     DeviceInfo* device_info = NULL;
 
-    // the current stream, managed from Python (see wp_cuda_context_set_stream() and wp_cuda_context_get_stream())
+    // Device-wide default stream, set once during device init.
+    // The active stream for a given thread is looked up via tl_streams
+    // (see wp_cuda_context_get_stream / wp_cuda_context_set_stream);
+    // this field serves as the fallback when a thread has not set its own.
     CUstream stream = NULL;
 
     // conditional graph node support, loaded on demand if the driver supports it (CUDA 12.4+)
@@ -232,11 +235,19 @@ static std::map<CUcontext, ContextInfo> g_contexts;
 
 // cached info for all known streams (including registered external streams)
 static std::unordered_map<CUstream, StreamInfo> g_streams;
+// Protects g_streams from concurrent access by multiple host threads
+// (e.g. DataLoader workers calling wp.stream_from_torch / ScopedStream).
+static std::mutex g_streams_mutex;
 
 // Ongoing graph captures registered using wp.capture_begin().
 // This maps the capture id to the stream where capture was started.
 // See wp_cuda_graph_begin_capture(), wp_cuda_graph_end_capture(), and wp_free_device_async().
 static std::unordered_map<uint64_t, CaptureInfo*> g_captures;
+
+// Thread-local current stream per CUDA context.  Each host thread owns
+// its own mapping so that concurrent ScopedStream usage does not race.
+// Falls back to ContextInfo::stream (the device default) when unset.
+static thread_local std::unordered_map<CUcontext, CUstream> tl_streams;
 
 // Memory allocated during graph capture requires special handling.
 // See wp_alloc_device_async() and wp_free_device_async().
@@ -394,6 +405,7 @@ static inline ContextInfo* get_context_info(void* context) { return get_context_
 
 static inline StreamInfo* get_stream_info(CUstream stream)
 {
+    std::lock_guard<std::mutex> lock(g_streams_mutex);
     auto it = g_streams.find(stream);
     if (it != g_streams.end())
         return &it->second;
@@ -771,11 +783,7 @@ void* wp_alloc_device_async(void* context, size_t s, const char* tag)
     // but we set the context here for consistent behaviour
     ContextGuard guard(context);
 
-    ContextInfo* context_info = get_context_info(context);
-    if (!context_info)
-        return NULL;
-
-    CUstream stream = context_info->stream;
+    CUstream stream = get_current_stream(context);
 
     void* ptr = NULL;
     check_cuda(cudaMallocAsync(&ptr, s, stream));
@@ -909,36 +917,39 @@ void wp_free_device_async(void* context, void* ptr, void** dbg_node_ret)
                 //   - The free node already depends on these nodes
                 //     (get_dependent_leaf_nodes() + cudaGraphAddMemFreeNode() above).
                 //   - We replace all alloc-dependent deps with the new free node. Other deps remain unchanged.
-                for (const auto& kv : g_streams) {
-                    cudaStream_t other_stream = kv.first;
-                    CUstreamCaptureStatus other_capture_status = CU_STREAM_CAPTURE_STATUS_NONE;
-                    uint64_t other_capture_id = 0;
-                    const cudaGraphNode_t* other_capture_deps = NULL;
-                    size_t other_dep_count = 0;
-                    if (check_cu(cuStreamGetCaptureInfo_f(
-                            other_stream, &other_capture_status, &other_capture_id, NULL, &other_capture_deps,
-                            &other_dep_count
-                        ))) {
-                        // check if the other stream is part of the same capture
-                        if (other_capture_status == CU_STREAM_CAPTURE_STATUS_ACTIVE && other_capture_id == capture_id) {
-                            // check if the stream's frontier includes alloc-dependent nodes
-                            if (contains_any(
-                                    other_capture_deps, other_capture_deps + other_dep_count, alloc_leaf_nodes.begin(),
-                                    alloc_leaf_nodes.end()
-                                )) {
-                                // Update the stream's capture deps. We replace all alloc-dependent deps with the new
-                                // free node. Other deps remain unchanged.
-                                std::vector<cudaGraphNode_t> new_deps { free_node };
-                                for (size_t i = 0; i < other_dep_count; i++) {
-                                    cudaGraphNode_t dep = other_capture_deps[i];
-                                    if (std::find(alloc_leaf_nodes.begin(), alloc_leaf_nodes.end(), dep)
-                                        == alloc_leaf_nodes.end()) {
-                                        new_deps.push_back(dep);
+                {
+                    std::lock_guard<std::mutex> lock(g_streams_mutex);
+                    for (const auto& kv : g_streams) {
+                        cudaStream_t other_stream = kv.first;
+                        CUstreamCaptureStatus other_capture_status = CU_STREAM_CAPTURE_STATUS_NONE;
+                        uint64_t other_capture_id = 0;
+                        const cudaGraphNode_t* other_capture_deps = NULL;
+                        size_t other_dep_count = 0;
+                        if (check_cu(cuStreamGetCaptureInfo_f(
+                                other_stream, &other_capture_status, &other_capture_id, NULL, &other_capture_deps,
+                                &other_dep_count
+                            ))) {
+                            // check if the other stream is part of the same capture
+                            if (other_capture_status == CU_STREAM_CAPTURE_STATUS_ACTIVE && other_capture_id == capture_id) {
+                                // check if the stream's frontier includes alloc-dependent nodes
+                                if (contains_any(
+                                        other_capture_deps, other_capture_deps + other_dep_count, alloc_leaf_nodes.begin(),
+                                        alloc_leaf_nodes.end()
+                                    )) {
+                                    // Update the stream's capture deps. We replace all alloc-dependent deps with the new
+                                    // free node. Other deps remain unchanged.
+                                    std::vector<cudaGraphNode_t> new_deps { free_node };
+                                    for (size_t i = 0; i < other_dep_count; i++) {
+                                        cudaGraphNode_t dep = other_capture_deps[i];
+                                        if (std::find(alloc_leaf_nodes.begin(), alloc_leaf_nodes.end(), dep)
+                                            == alloc_leaf_nodes.end()) {
+                                            new_deps.push_back(dep);
+                                        }
                                     }
+                                    check_cu(cuStreamUpdateCaptureDependencies_f(
+                                        other_stream, new_deps.data(), new_deps.size(), CU_STREAM_SET_CAPTURE_DEPENDENCIES
+                                    ));
                                 }
-                                check_cu(cuStreamUpdateCaptureDependencies_f(
-                                    other_stream, new_deps.data(), new_deps.size(), CU_STREAM_SET_CAPTURE_DEPENDENCIES
-                                ));
                             }
                         }
                     }
@@ -2462,7 +2473,19 @@ int wp_cuda_context_is_primary(void* context)
 
 void* wp_cuda_context_get_stream(void* context)
 {
-    ContextInfo* info = get_context_info(static_cast<CUcontext>(context));
+    CUcontext ctx = static_cast<CUcontext>(context);
+    if (!ctx)
+        ctx = get_current_context();
+
+    // Check thread-local override first
+    if (ctx) {
+        auto it = tl_streams.find(ctx);
+        if (it != tl_streams.end())
+            return it->second;
+    }
+
+    // Fall back to device-wide default
+    ContextInfo* info = get_context_info(ctx);
     if (info) {
         return info->stream;
     }
@@ -2471,13 +2494,16 @@ void* wp_cuda_context_get_stream(void* context)
 
 void wp_cuda_context_set_stream(void* context, void* stream, int sync)
 {
-    ContextInfo* context_info = get_context_info(static_cast<CUcontext>(context));
-    if (context_info) {
-        CUstream new_stream = static_cast<CUstream>(stream);
+    CUcontext ctx = static_cast<CUcontext>(context);
+    if (!ctx)
+        ctx = get_current_context();
 
-        // check whether we should sync with the previous stream on this device
-        if (sync) {
-            CUstream old_stream = context_info->stream;
+    CUstream new_stream = static_cast<CUstream>(stream);
+
+    // check whether we should sync with the previous stream on this thread
+    if (sync && ctx) {
+        CUstream old_stream = static_cast<CUstream>(wp_cuda_context_get_stream(ctx));
+        if (old_stream && old_stream != new_stream) {
             StreamInfo* old_stream_info = get_stream_info(old_stream);
             if (old_stream_info) {
                 CUevent cached_event = old_stream_info->cached_event;
@@ -2485,8 +2511,18 @@ void wp_cuda_context_set_stream(void* context, void* stream, int sync)
                 check_cu(cuStreamWaitEvent_f(new_stream, cached_event, CU_EVENT_WAIT_DEFAULT));
             }
         }
+    }
 
-        context_info->stream = new_stream;
+    if (ctx) {
+        // Write to thread-local storage
+        tl_streams[ctx] = new_stream;
+
+        // Also set the device-wide default if not yet initialised
+        // (first call from _init_streams on the main thread)
+        ContextInfo* info = get_context_info(ctx);
+        if (info && info->stream == NULL) {
+            info->stream = new_stream;
+        }
     }
 }
 
@@ -2778,6 +2814,7 @@ void wp_cuda_stream_register(void* context, void* stream)
     ContextGuard guard(context);
 
     // populate stream info
+    std::lock_guard<std::mutex> lock(g_streams_mutex);
     StreamInfo& stream_info = g_streams[static_cast<CUstream>(stream)];
     check_cu(cuEventCreate_f(&stream_info.cached_event, CU_EVENT_DISABLE_TIMING));
 }
@@ -2789,11 +2826,13 @@ void wp_cuda_stream_unregister(void* context, void* stream)
 
     CUstream cuda_stream = static_cast<CUstream>(stream);
 
-    StreamInfo* stream_info = get_stream_info(cuda_stream);
-    if (stream_info) {
-        // release stream info
-        check_cu(cuEventDestroy_f(stream_info->cached_event));
-        g_streams.erase(cuda_stream);
+    {
+        std::lock_guard<std::mutex> lock(g_streams_mutex);
+        auto it = g_streams.find(cuda_stream);
+        if (it != g_streams.end()) {
+            check_cu(cuEventDestroy_f(it->second.cached_event));
+            g_streams.erase(it);
+        }
     }
 
     // make sure we don't leave dangling references to this stream
@@ -2801,6 +2840,13 @@ void wp_cuda_stream_unregister(void* context, void* stream)
     if (context_info) {
         if (cuda_stream == context_info->stream)
             context_info->stream = NULL;
+    }
+
+    // Also clear from this thread's TLS if it was the active stream
+    CUcontext ctx = static_cast<CUcontext>(context);
+    auto it = tl_streams.find(ctx);
+    if (it != tl_streams.end() && it->second == cuda_stream) {
+        tl_streams.erase(it);
     }
 }
 
