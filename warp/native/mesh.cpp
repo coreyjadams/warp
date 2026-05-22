@@ -12,10 +12,19 @@
 using namespace wp;
 
 #include <map>
+#include <mutex>
 
 namespace {
 // host-side copy of mesh descriptors, maps GPU mesh address (id) to a CPU desc
 std::map<uint64_t, Mesh> g_mesh_descriptors;
+
+// Protects g_mesh_descriptors from concurrent mutation by multiple host
+// threads (e.g. DataLoader workers each constructing or destroying their
+// own wp.Mesh on their own CUDA stream).  std::map is not thread-safe
+// for concurrent insert/erase from multiple threads; rebalancing under
+// race can hand out garbage iterators that later surface as illegal
+// memory accesses in the kernel that reads `mesh.id`.
+std::mutex g_mesh_descriptors_mutex;
 
 }  // anonymous namespace
 
@@ -24,6 +33,7 @@ namespace wp {
 
 bool mesh_get_descriptor(uint64_t id, Mesh& mesh)
 {
+    std::lock_guard<std::mutex> lock(g_mesh_descriptors_mutex);
     const auto& iter = g_mesh_descriptors.find(id);
     if (iter == g_mesh_descriptors.end())
         return false;
@@ -34,6 +44,7 @@ bool mesh_get_descriptor(uint64_t id, Mesh& mesh)
 
 bool mesh_set_descriptor(uint64_t id, const Mesh& mesh)
 {
+    std::lock_guard<std::mutex> lock(g_mesh_descriptors_mutex);
     const auto& iter = g_mesh_descriptors.find(id);
     if (iter == g_mesh_descriptors.end())
         return false;
@@ -42,9 +53,17 @@ bool mesh_set_descriptor(uint64_t id, const Mesh& mesh)
     return true;
 }
 
-void mesh_add_descriptor(uint64_t id, const Mesh& mesh) { g_mesh_descriptors[id] = mesh; }
+void mesh_add_descriptor(uint64_t id, const Mesh& mesh)
+{
+    std::lock_guard<std::mutex> lock(g_mesh_descriptors_mutex);
+    g_mesh_descriptors[id] = mesh;
+}
 
-void mesh_rem_descriptor(uint64_t id) { g_mesh_descriptors.erase(id); }
+void mesh_rem_descriptor(uint64_t id)
+{
+    std::lock_guard<std::mutex> lock(g_mesh_descriptors_mutex);
+    g_mesh_descriptors.erase(id);
+}
 
 }  // namespace wp
 

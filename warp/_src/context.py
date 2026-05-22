@@ -3888,6 +3888,13 @@ class Device:
         self._stream = None
         self.null_stream = None
 
+        ### Probe: serialize the lazy-context-acquire path so a second
+        ### thread reading `device.stream` while another thread is mid-
+        ### init can't see `self._context` published but `self._stream`
+        ### still None. RLock because `_init_streams` re-enters
+        ### `self.context` via `Stream(self)` and `self.set_stream(...)`.
+        self._context_lock = threading.RLock()
+
         # maps streams to started graph captures
         self.captures = {}
 
@@ -4046,20 +4053,28 @@ class Device:
     @property
     def context(self):
         """The context associated with the device."""
-        if self._context is not None:
-            return self._context
-        elif self.is_primary:
-            # acquire primary context on demand
-            prev_context = runtime.core.wp_cuda_context_get_current()
-            self._context = self.runtime.core.wp_cuda_device_get_primary_context(self.ordinal)
-            if self._context is None:
+        ### Probe: serialize the entire property under the per-Device
+        ### RLock. The fast path (self._context already set) pays one
+        ### RLock acquire/release; the slow path (lazy acquire +
+        ### _init_streams) is atomic so no other thread can observe
+        ### self._context published while self._stream is still None.
+        ### RLock is required because _init_streams re-enters this
+        ### property via Stream(self) and self.set_stream(...).
+        with self._context_lock:
+            if self._context is not None:
+                return self._context
+            elif self.is_primary:
+                # acquire primary context on demand
+                prev_context = runtime.core.wp_cuda_context_get_current()
+                self._context = self.runtime.core.wp_cuda_device_get_primary_context(self.ordinal)
+                if self._context is None:
+                    runtime.core.wp_cuda_context_set_current(prev_context)
+                    raise RuntimeError(f"Failed to acquire primary context for device {self}")
+                self.runtime.context_map[self._context] = self
+                # initialize streams
+                self._init_streams()
                 runtime.core.wp_cuda_context_set_current(prev_context)
-                raise RuntimeError(f"Failed to acquire primary context for device {self}")
-            self.runtime.context_map[self._context] = self
-            # initialize streams
-            self._init_streams()
-            runtime.core.wp_cuda_context_set_current(prev_context)
-        return self._context
+            return self._context
 
     @property
     def has_context(self) -> bool:

@@ -235,6 +235,12 @@ static std::map<CUdevice, DeviceInfo*> g_device_map;
 
 // cached info for all known contexts
 static std::map<CUcontext, ContextInfo> g_contexts;
+// Protects g_contexts from concurrent mutation by multiple host
+// threads.  get_context_info() does a find-then-insert, and concurrent
+// wp_cuda_context_destroy() erases.  std::map references are stable
+// across insert/erase, so callers can hold ContextInfo* outside the
+// lock; the lock only covers the lookup/mutation itself.
+static std::mutex g_contexts_mutex;
 
 // cached info for all known streams (including registered external streams)
 static std::unordered_map<CUstream, StreamInfo> g_streams;
@@ -386,6 +392,7 @@ static ContextInfo* get_context_info(CUcontext ctx)
             return NULL;
     }
 
+    std::lock_guard<std::mutex> lock(g_contexts_mutex);
     auto it = g_contexts.find(ctx);
     if (it != g_contexts.end()) {
         return &it->second;
@@ -2709,6 +2716,7 @@ void wp_cuda_context_destroy(void* context)
             if (info->conditional_module)
                 check_cu(cuModuleUnload_f(info->conditional_module));
 
+            std::lock_guard<std::mutex> lock(g_contexts_mutex);
             g_contexts.erase(ctx);
         }
 

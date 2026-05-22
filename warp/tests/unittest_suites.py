@@ -95,6 +95,7 @@ def default_suite(test_loader: unittest.TestLoader = unittest.defaultTestLoader)
     from warp.tests.cuda.test_occupancy import TestOccupancy
     from warp.tests.cuda.test_peer import TestPeer
     from warp.tests.cuda.test_pinned import TestPinned
+    from warp.tests.cuda.test_stream_threads import TestStreamThreads
     from warp.tests.cuda.test_streams import TestStreams
     from warp.tests.cuda.test_texture import TestTexture
     from warp.tests.cuda.test_unified_memory import TestUnifiedMemory
@@ -364,6 +365,7 @@ def default_suite(test_loader: unittest.TestLoader = unittest.defaultTestLoader)
         TestSpatial,
         TestSpecialValues,
         TestStatic,
+        TestStreamThreads,
         TestStreams,
         TestStruct,
         TestSubscriptTypes,

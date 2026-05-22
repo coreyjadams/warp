@@ -11,6 +11,7 @@ import inspect
 import math
 import struct
 import sys
+import threading
 import types
 import zlib
 from collections.abc import Callable, Mapping, Sequence
@@ -5462,6 +5463,14 @@ class Bvh:
 
         self.runtime = warp._src.context.runtime
 
+        ### Per-stream event tracking so __del__ can wait for any kernel
+        ### that used this BVH to complete before the underlying GPU
+        ### memory is freed. See record_stream / __del__. Initialised
+        ### before allocation so the attributes are guaranteed to exist
+        ### on every fully-constructed Bvh.
+        self._launch_events: dict[int, warp._src.context.Event] = {}
+        self._launch_events_lock = threading.Lock()
+
         if constructor is None:
             if self.device.is_cpu:
                 constructor = BvhConstructor.SAH
@@ -5503,6 +5512,54 @@ class Bvh:
                 leaf_size,
             )
 
+    def record_stream(self, stream: warp._src.context.Stream | None) -> None:
+        """Tell this BVH it is being used on ``stream``.
+
+        Same name and semantic as :meth:`torch.Tensor.record_stream`:
+        records a CUDA event on ``stream`` (creating one and caching it
+        on first use per stream) so that :meth:`__del__` can wait for
+        every stream that used the BVH to drain before the underlying
+        GPU memory is freed.
+
+        Calling this after every ``wp.launch(..., stream=stream)`` that
+        consumes ``bvh.id`` is required for correctness when
+        ``CUDA_LAUNCH_BLOCKING=0`` and the launch stream is not warp's
+        default stream; without it, the destructor races the in-flight
+        kernel and the kernel reads freed BVH pointers (CUDA error 700).
+
+        Cheap (one ``cudaEventRecord`` per call, dict overwrite per
+        stream is implicit because events on the same stream are
+        ordered) and a no-op on CPU BVHs / when ``stream is None``.
+
+        Args:
+            stream: The stream the BVH is currently being used on,
+                typically the same stream passed to ``wp.launch``.
+        """
+        if self.device.is_cpu or stream is None or not self.id:
+            return
+
+        ### Cache one Event per stream. Events on the same stream are
+        ### ordered, so re-recording the same Event tracks "the latest
+        ### point on this stream that referenced the BVH" -- waiting on
+        ### it implicitly waits on all earlier work on that stream.
+        key = stream.cuda_stream
+        if key is None:
+            return
+
+        with self._launch_events_lock:
+            event = self._launch_events.get(key)
+            if event is None:
+                event = warp._src.context.Event(stream.device)
+                self._launch_events[key] = event
+
+        ### Recording is itself ordered against the stream; the lock
+        ### only needs to protect the dict op. Two concurrent
+        ### record_stream calls on the same stream are safe -- both end
+        ### up recording on the same stream, and the latest record
+        ### supersedes the earlier one (which is already implicit in
+        ### CUDA stream-event semantics).
+        stream.record_event(event)
+
     def __del__(self):
         if not self.id:
             return
@@ -5513,6 +5570,27 @@ class Bvh:
             else:
                 # use CUDA context guard to avoid side effects during garbage collection
                 with self.device.context_guard:
+                    ### Drain every stream that was told this BVH was in
+                    ### use on it before freeing the GPU memory;
+                    ### otherwise an in-flight kernel reading the BVH
+                    ### pointers gets CUDA error 700 ("an illegal memory
+                    ### access was encountered") under
+                    ### CUDA_LAUNCH_BLOCKING=0. See record_stream.
+                    ###
+                    ### `event.synchronize` host-blocks, but it only
+                    ### blocks on the streams the user explicitly told us
+                    ### were active and only fires at GC time, so in
+                    ### practice the kernels have already drained and the
+                    ### call returns immediately. A future C-side
+                    ### `wp_bvh_destroy_device_async(stream)` could turn
+                    ### this into a stream-wait + async-free for full
+                    ### async correctness.
+                    events = self._launch_events
+                    if events:
+                        with self._launch_events_lock:
+                            event_list = list(events.values())
+                        for event in event_list:
+                            self.runtime.core.wp_cuda_event_synchronize(event.cuda_event)
                     self.runtime.core.wp_bvh_destroy_device(self.id)
         except (TypeError, AttributeError):
             # Suppress TypeError and AttributeError when callables become None during shutdown
@@ -5668,6 +5746,14 @@ class Mesh:
         self.groups = groups
         self.runtime = warp._src.context.runtime
 
+        ### Per-stream event tracking so __del__ can wait for any kernel
+        ### that used this mesh's BVH to complete before the BVH GPU
+        ### memory is freed. See record_stream / __del__. Initialised
+        ### before BVH allocation so the attributes are guaranteed to
+        ### exist on every fully-constructed Mesh.
+        self._launch_events: dict[int, warp._src.context.Event] = {}
+        self._launch_events_lock = threading.Lock()
+
         if bvh_constructor is None:
             if self.device.is_cpu:
                 bvh_constructor = BvhConstructor.SAH
@@ -5727,6 +5813,54 @@ class Mesh:
         if not self.id:
             raise RuntimeError(f"Failed to create mesh: {self.runtime.get_error_string()}")
 
+    def record_stream(self, stream: warp._src.context.Stream | None) -> None:
+        """Tell this mesh it is being used on ``stream``.
+
+        Same name and semantic as :meth:`torch.Tensor.record_stream`:
+        records a CUDA event on ``stream`` (creating one and caching it
+        on first use per stream) so that :meth:`__del__` can wait for
+        every stream that used the mesh to drain before the BVH GPU
+        memory is freed.
+
+        Calling this after every ``wp.launch(..., stream=stream)`` that
+        consumes ``mesh.id`` is required for correctness when
+        ``CUDA_LAUNCH_BLOCKING=0`` and the launch stream is not warp's
+        default stream; without it, the destructor races the in-flight
+        kernel and the kernel reads freed BVH pointers (CUDA error 700).
+
+        Cheap (one ``cudaEventRecord`` per call, dict overwrite per
+        stream is implicit because events on the same stream are
+        ordered) and a no-op on CPU meshes / when ``stream is None``.
+
+        Args:
+            stream: The stream the mesh is currently being used on,
+                typically the same stream passed to ``wp.launch``.
+        """
+        if self.device.is_cpu or stream is None or not self.id:
+            return
+
+        ### Cache one Event per stream. Events on the same stream are
+        ### ordered, so re-recording the same Event tracks "the latest
+        ### point on this stream that referenced the mesh" -- waiting on
+        ### it implicitly waits on all earlier work on that stream.
+        key = stream.cuda_stream
+        if key is None:
+            return
+
+        with self._launch_events_lock:
+            event = self._launch_events.get(key)
+            if event is None:
+                event = warp._src.context.Event(stream.device)
+                self._launch_events[key] = event
+
+        ### Recording is itself ordered against the stream; the lock
+        ### only needs to protect the dict op. Two concurrent
+        ### record_stream calls on the same stream are safe -- both end
+        ### up recording on the same stream, and the latest record
+        ### supersedes the earlier one (which is already implicit in
+        ### CUDA stream-event semantics).
+        stream.record_event(event)
+
     def __del__(self):
         if not self.id:
             return
@@ -5737,6 +5871,27 @@ class Mesh:
             else:
                 # use CUDA context guard to avoid side effects during garbage collection
                 with self.device.context_guard:
+                    ### Drain every stream that was told this mesh was in
+                    ### use on it before freeing the BVH GPU memory;
+                    ### otherwise an in-flight kernel reading the BVH
+                    ### pointers gets CUDA error 700 ("an illegal memory
+                    ### access was encountered") under
+                    ### CUDA_LAUNCH_BLOCKING=0. See record_stream.
+                    ###
+                    ### `event.synchronize` host-blocks, but it only
+                    ### blocks on the streams the user explicitly told us
+                    ### were active and only fires at GC time, so in
+                    ### practice the kernels have already drained and the
+                    ### call returns immediately. A future C-side
+                    ### `wp_mesh_destroy_device_async(stream)` could turn
+                    ### this into a stream-wait + async-free for full
+                    ### async correctness.
+                    events = self._launch_events
+                    if events:
+                        with self._launch_events_lock:
+                            event_list = list(events.values())
+                        for event in event_list:
+                            self.runtime.core.wp_cuda_event_synchronize(event.cuda_event)
                     self.runtime.core.wp_mesh_destroy_device(self.id)
         except (TypeError, AttributeError):
             # Suppress TypeError and AttributeError when callables become None during shutdown
