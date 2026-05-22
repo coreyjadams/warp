@@ -1,20 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import gc
 import unittest
 
 import warp as wp
 from warp.tests.unittest_utils import *
-
-
-def get_device_pair_with_mempool_access_support():
-    devices = wp.get_cuda_devices()
-    for target_device in devices:
-        for peer_device in devices:
-            if target_device != peer_device:
-                if wp.is_mempool_access_supported(target_device, peer_device):
-                    return (target_device, peer_device)
-    return None
 
 
 def get_device_pair_without_mempool_access_support():
@@ -63,6 +54,9 @@ def test_mempool_usage_queries(test, device):
     """Check API to query mempool memory usage."""
 
     device = wp.get_device(device)
+    gc.collect()
+    wp.synchronize_device(device)
+
     pre_alloc_mempool_usage_curr = wp.get_mempool_used_mem_current(device)
     pre_alloc_mempool_usage_high = wp.get_mempool_used_mem_high(device)
 
@@ -77,10 +71,16 @@ def test_mempool_usage_queries(test, device):
     test.assertEqual(
         post_alloc_mempool_usage_curr, pre_alloc_mempool_usage_curr + 1048576, "Memory usage did not increase by 1 MiB"
     )
-    test.assertGreaterEqual(post_alloc_mempool_usage_high, 1048576, "High-water mark is not at least 1 MiB")
+    expected_post_alloc_mempool_usage_high = max(pre_alloc_mempool_usage_high, post_alloc_mempool_usage_curr)
+    test.assertGreaterEqual(
+        post_alloc_mempool_usage_high,
+        expected_post_alloc_mempool_usage_high,
+        "High-water mark did not cover the post-allocation memory usage.",
+    )
 
     # Free the allocation
     del test_data
+    gc.collect()
     wp.synchronize_device(device)
 
     # Query memory usage
@@ -128,9 +128,9 @@ def test_mempool_access_self(test, device):
     test.assertTrue(enabled)
 
 
-@unittest.skipUnless(get_device_pair_with_mempool_access_support(), "Requires devices with mempool access support")
+@unittest.skipUnless(get_cuda_device_pair_with_mempool_access_support(), "Requires devices with mempool access support")
 def test_mempool_access(test, _):
-    target_device, peer_device = get_device_pair_with_mempool_access_support()
+    target_device, peer_device = get_cuda_device_pair_with_mempool_access_support()
 
     was_enabled = wp.is_mempool_access_enabled(target_device, peer_device)
 

@@ -102,6 +102,10 @@
 - Remove placeholder adjoints for built-ins that are not mathematically differentiable. No
   user-visible behavior change for code that respects the `is_differentiable=False` contract
   ([GH-988](https://github.com/NVIDIA/warp/issues/988)).
+- Allow GPU kernels to receive CPU arrays on systems where the GPU reports direct pageable CPU memory access,
+  enabling zero-copy launches on HMM and ATS systems. Add `warp.config.launch_verification_mode` with relaxed, strict,
+  and checked modes for pre-launch accessibility diagnostics on mixed-device array launches
+  ([GH-1461](https://github.com/NVIDIA/warp/issues/1461)).
 
 ### Fixed
 
@@ -145,6 +149,8 @@
   placeholder adjoints, so unsupported gradients no longer appear to be implemented for APIs
   such as vector `wp.sign()`, `wp.volume_sample_i()`, and the 4-D `wp.atomic_exch()` overload
   ([GH-1466](https://github.com/NVIDIA/warp/issues/1466)).
+- Fix tile byte-offset overflow for arrays larger than 2 GiB
+  ([GH-1422](https://github.com/NVIDIA/warp/issues/1422)).
 
 ### Documentation
 
@@ -313,6 +319,9 @@
 - Fix `wp.constant(wp.int32(IntEnum_value))` emitting the symbolic enum name instead of the
   integer value in generated C++/CUDA code on Python 3.10, causing compilation failures
   ([newton#2363](https://github.com/newton-physics/newton/issues/2363)).
+- Fix `wp.array.fill_()` performing temporary device allocations for common fill values,
+  which broke CUDA graph composability. Oversized fill values still fall back to the
+  previous staging path.
 
 ### Documentation
 

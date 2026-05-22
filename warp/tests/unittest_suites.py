@@ -85,6 +85,7 @@ def default_suite(test_loader: unittest.TestLoader = unittest.defaultTestLoader)
 
     Intended to be modified to create additional test suites
     """
+    from warp.tests.cuda.test_array_fill_capture import TestArrayFillCapture
     from warp.tests.cuda.test_async import TestAsync
     from warp.tests.cuda.test_capture_mode import TestCaptureMode
     from warp.tests.cuda.test_clang_cuda import TestClangCUDA
@@ -96,6 +97,7 @@ def default_suite(test_loader: unittest.TestLoader = unittest.defaultTestLoader)
     from warp.tests.cuda.test_pinned import TestPinned
     from warp.tests.cuda.test_streams import TestStreams
     from warp.tests.cuda.test_texture import TestTexture
+    from warp.tests.cuda.test_unified_memory import TestUnifiedMemory
     from warp.tests.fem.test_fem_examples import TestFemDiffusionExamples, TestFemExamples
     from warp.tests.fem.test_fem_field import TestFemField
     from warp.tests.fem.test_fem_fp64 import TestFemFp64
@@ -229,6 +231,7 @@ def default_suite(test_loader: unittest.TestLoader = unittest.defaultTestLoader)
     from warp.tests.tile.test_tile_fft_no_mathdx import TestTileFFTNoMathDx
     from warp.tests.tile.test_tile_func_arg import TestTileFuncArg
     from warp.tests.tile.test_tile_fused_ops import TestTileFusedOps
+    from warp.tests.tile.test_tile_large_offsets import TestTileLargeOffsets
     from warp.tests.tile.test_tile_load import TestTileLoad
     from warp.tests.tile.test_tile_mathdx import TestTileMathDx
     from warp.tests.tile.test_tile_matmul import TestTileMatmul
@@ -249,6 +252,7 @@ def default_suite(test_loader: unittest.TestLoader = unittest.defaultTestLoader)
         TestApicMesh,
         TestArithmetic,
         TestArray,
+        TestArrayFillCapture,
         TestArrayReduce,
         TestAsync,
         TestAtomic,
@@ -375,6 +379,7 @@ def default_suite(test_loader: unittest.TestLoader = unittest.defaultTestLoader)
         TestTileFFTNoMathDx,
         TestTileFuncArg,
         TestTileFusedOps,
+        TestTileLargeOffsets,
         TestTileLoad,
         TestTileMathDx,
         TestTileMatmul,
@@ -391,6 +396,7 @@ def default_suite(test_loader: unittest.TestLoader = unittest.defaultTestLoader)
         TestTriangleClosestPoint,
         TestTypes,
         TestUniqueModule,
+        TestUnifiedMemory,
         TestUtils,
         TestVec,
         TestVecConstructors,
