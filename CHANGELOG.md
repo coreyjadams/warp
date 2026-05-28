@@ -151,6 +151,28 @@
   ([GH-1466](https://github.com/NVIDIA/warp/issues/1466)).
 - Fix tile byte-offset overflow for arrays larger than 2 GiB
   ([GH-1422](https://github.com/NVIDIA/warp/issues/1422)).
+- Fix illegal-memory-access crashes when allocating and freeing Warp arrays,
+  meshes, and BVHs concurrently from multiple host threads sharing
+  non-blocking CUDA streams (e.g. PyTorch DataLoader workers). Stream-ordered
+  frees now run on the host thread's current stream rather than the legacy
+  NULL stream, so mempool reuse stays correctly ordered with the kernels
+  that consumed the memory.
+- Fix use-after-free of stream cached events when multiple
+  ``wp.stream_from_torch()`` wrappers shared the same underlying CUstream.
+  External stream registration/unregistration is now reference-counted.
+- Make ``wp.Mesh`` and ``wp.Bvh`` destruction stream-ordered and
+  non-host-blocking, removing the per-destructor ``cuEventSynchronize``
+  that previously serialized multi-threaded workloads. Tracked streams
+  (via ``record_stream``) drive the destroy directly; otherwise the
+  destroy falls back to the build-time stream stashed at construction.
+- Guard the BVH, mesh, graph-capture, and graph-allocation descriptor maps
+  with mutexes so concurrent host threads can safely construct and destroy
+  Warp objects without corrupting the underlying ``std::map``/
+  ``std::unordered_map`` containers.
+- Avoid dangling pointers into the internal stream table by returning
+  stream lookup results by value, so a concurrent
+  ``wp.stream_from_torch()`` unregister no longer races readers in
+  ``ScopedStream`` / graph-capture entry points.
 
 ### Documentation
 
