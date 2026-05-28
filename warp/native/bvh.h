@@ -618,6 +618,11 @@ void bvh_create_device(
     BVH& bvh_device_on_host
 );
 void bvh_destroy_device(BVH& bvh);
+// Stream-ordered variant of bvh_destroy_device that frees every BVH
+// device buffer on `stream` (via wp_free_device_on_stream) so the
+// mempool's stream-ordering keeps the memory reserved until prior
+// kernels on `stream` have actually completed.
+void bvh_destroy_device_async(BVH& bvh, void* stream);
 void bvh_refit_device(BVH& bvh);
 void cubql_bvh_create_device(
     void* context, vec3* lowers, vec3* uppers, int num_items, int leaf_size, CuBQLBVH& bvh_device_on_host

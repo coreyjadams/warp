@@ -371,6 +371,48 @@ void wp_mesh_destroy_device(uint64_t id)
     }
 }
 
+// Stream-ordered destroy.  Used by Python's Mesh.__del__ after it
+// arranges for `stream` to wait on every kernel that touched the mesh
+// (via Mesh.record_stream + cuStreamWaitEvent for any additional
+// recorded streams).  Every free is queued on `stream`, so the mempool
+// keeps the freed GPU memory reserved until those kernels actually
+// retire -- no host-side cuEventSynchronize block.
+//
+// The cuBQL backend has no stream-ordered destroy variant yet, so this
+// falls back to the host-blocking cubql_bvh_destroy_device for that
+// backend (still safer than today because the per-BVH frees themselves
+// route through wp_free_device, which is now stream-ordered on the
+// current host thread's stream).
+void wp_mesh_destroy_device_async(uint64_t id, void* stream)
+{
+    wp::Mesh mesh;
+    if (wp::mesh_get_descriptor(id, mesh)) {
+        ContextGuard guard(mesh.context);
+
+#ifndef WP_DISABLE_CUBQL
+        if (mesh.bvh_backend == wp::MESH_BVH_BACKEND_CUBQL) {
+            // No async destroy for cuBQL yet -- the existing
+            // host-blocking path stays correct because the cubql
+            // destroy itself uses wp_free_device which is now
+            // stream-ordered.
+            wp::cubql_bvh_destroy_device(mesh.cubql_bvh);
+        } else
+#endif
+        {
+            wp::bvh_destroy_device_async(mesh.bvh, stream);
+        }
+
+        wp_free_device_on_stream(WP_CURRENT_CONTEXT, mesh.lowers, stream);
+        wp_free_device_on_stream(WP_CURRENT_CONTEXT, mesh.uppers, stream);
+        wp_free_device_on_stream(WP_CURRENT_CONTEXT, (wp::Mesh*)id, stream);
+
+        if (mesh.solid_angle_props) {
+            wp_free_device_on_stream(WP_CURRENT_CONTEXT, mesh.solid_angle_props, stream);
+        }
+        wp::mesh_rem_descriptor(id);
+    }
+}
+
 void mesh_update_stats(uint64_t id) { }
 
 int wp_mesh_refit_device(uint64_t id)

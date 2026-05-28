@@ -764,6 +764,33 @@ void bvh_destroy_device(BVH& bvh)
     bvh.root = NULL;
 }
 
+// Same as bvh_destroy_device, but routes every cudaFreeAsync onto the
+// caller-supplied `stream` instead of the current host thread's stream.
+//
+// This lets the Python destructor pick a single "destruction stream",
+// arrange for it to wait for every recorded usage event of the BVH (via
+// cuStreamWaitEvent), and then queue the frees on that stream -- so the
+// mempool's stream-ordering keeps the freed memory reserved until every
+// kernel that read the BVH has actually retired, without any host-side
+// cuEventSynchronize block.
+void bvh_destroy_device_async(BVH& bvh, void* stream)
+{
+    ContextGuard guard(bvh.context);
+
+    wp_free_device_on_stream(WP_CURRENT_CONTEXT, bvh.node_lowers, stream);
+    bvh.node_lowers = NULL;
+    wp_free_device_on_stream(WP_CURRENT_CONTEXT, bvh.node_uppers, stream);
+    bvh.node_uppers = NULL;
+    wp_free_device_on_stream(WP_CURRENT_CONTEXT, bvh.node_parents, stream);
+    bvh.node_parents = NULL;
+    wp_free_device_on_stream(WP_CURRENT_CONTEXT, bvh.node_counts, stream);
+    bvh.node_counts = NULL;
+    wp_free_device_on_stream(WP_CURRENT_CONTEXT, bvh.primitive_indices, stream);
+    bvh.primitive_indices = NULL;
+    wp_free_device_on_stream(WP_CURRENT_CONTEXT, bvh.root, stream);
+    bvh.root = NULL;
+}
+
 void bvh_refit_device(BVH& bvh)
 {
     ContextGuard guard(bvh.context);
@@ -1097,6 +1124,23 @@ void wp_bvh_destroy_device(uint64_t id)
 
         // free descriptor
         wp_free_device(WP_CURRENT_CONTEXT, (void*)id);
+    }
+}
+
+// Stream-ordered destroy.  See bvh_destroy_device_async() above for
+// motivation -- Python's Bvh.__del__ calls this after arranging for
+// `stream` to wait on every kernel that used the BVH, so freeing the
+// per-BVH GPU memory on `stream` is race-free without a host block.
+void wp_bvh_destroy_device_async(uint64_t id, void* stream)
+{
+    wp::BVH bvh;
+    if (wp::bvh_get_descriptor(id, bvh)) {
+        wp::bvh_destroy_device_async(bvh, stream);
+        wp::bvh_rem_descriptor(id);
+
+        // Free the descriptor itself on the same stream so it stays
+        // alive on the GPU until the BVH it described is also freed.
+        wp_free_device_on_stream(WP_CURRENT_CONTEXT, (void*)id, stream);
     }
 }
 

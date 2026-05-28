@@ -60,6 +60,8 @@ WP_API void wp_free_pinned(void* ptr);
 WP_API void wp_free_device(void* context, void* ptr);  // uses cudaFreeAsync() if supported, cudaFree() otherwise
 WP_API void wp_free_device_default(void* context, void* ptr);  // uses cudaFree()
 WP_API void wp_free_device_async(void* context, void* ptr, void** dbg_node_ret = nullptr);  // uses cudaFreeAsync()
+// Free a mempool-allocated device pointer on an explicit caller-supplied stream
+WP_API void wp_free_device_on_stream(void* context, void* ptr, void* stream);
 
 WP_API bool wp_memcpy_h2h(void* dest, void* src, size_t n);
 WP_API bool wp_memcpy_h2d(void* context, void* dest, void* src, size_t n, void* stream = WP_CURRENT_STREAM);
@@ -88,6 +90,9 @@ WP_API uint64_t wp_bvh_create_device(
     void* context, wp::vec3* lowers, wp::vec3* uppers, int num_items, int constructor_type, int* groups, int leaf_size
 );
 WP_API void wp_bvh_destroy_device(uint64_t id);
+// Stream-ordered destroy: frees are queued on `stream`; caller must ensure
+// `stream` waits on any in-flight kernels reading the BVH. No host-side block.
+WP_API void wp_bvh_destroy_device_async(uint64_t id, void* stream);
 WP_API void wp_bvh_refit_device(uint64_t id);
 WP_API void wp_bvh_rebuild_device(uint64_t id);
 
@@ -131,6 +136,9 @@ WP_API uint64_t wp_mesh_create_device(
     int bvh_leaf_size
 );
 WP_API void wp_mesh_destroy_device(uint64_t id);
+// Stream-ordered destroy: frees are queued on `stream`; caller must ensure
+// `stream` waits on any in-flight kernels reading the mesh. No host-side block.
+WP_API void wp_mesh_destroy_device_async(uint64_t id, void* stream);
 WP_API int wp_mesh_refit_device(uint64_t id);
 
 WP_API void wp_mesh_set_points_host(uint64_t id, wp::array_t<wp::vec3> points);
@@ -147,6 +155,9 @@ WP_API void wp_hash_grid_reserve_host(uint64_t id, int type, int num_points);
 
 WP_API uint64_t wp_hash_grid_create_device(void* context, int type, int dim_x, int dim_y, int dim_z);
 WP_API void wp_hash_grid_destroy_device(uint64_t id, int type);
+// Stream-ordered destroy: frees are queued on `stream`; caller must ensure
+// `stream` waits on any in-flight kernels reading the hash grid. No host-side block.
+WP_API void wp_hash_grid_destroy_device_async(uint64_t id, int type, void* stream);
 WP_API void wp_hash_grid_update_device(uint64_t id, int type, double cell_width, const void* points);
 WP_API void wp_hash_grid_reserve_device(uint64_t id, int type, int num_points);
 

@@ -11,6 +11,7 @@
 #include <climits>
 #include <functional>
 #include <map>
+#include <mutex>
 #include <vector>
 
 #ifndef WP_DISABLE_CUBQL
@@ -749,6 +750,16 @@ namespace {
 // host-side copy of bvh descriptors, maps GPU bvh address (id) to a CPU desc
 std::map<uint64_t, BVH> g_bvh_descriptors;
 std::map<uint64_t, CuBQLBVH> g_cubql_bvh_descriptors;
+
+// Protects g_bvh_descriptors / g_cubql_bvh_descriptors from concurrent
+// mutation by multiple host threads (e.g. DataLoader workers each
+// constructing or destroying their own wp.Bvh on their own CUDA stream).
+// std::map is not thread-safe for concurrent insert/erase from multiple
+// threads; rebalancing under race can hand out garbage iterators that
+// later surface as illegal memory accesses in the kernel that reads
+// `bvh.id`.  Mirrors the g_mesh_descriptors_mutex pattern in mesh.cpp.
+std::mutex g_bvh_descriptors_mutex;
+std::mutex g_cubql_bvh_descriptors_mutex;
 }  // anonymous namespace
 
 
@@ -756,6 +767,7 @@ namespace wp {
 
 bool bvh_get_descriptor(uint64_t id, BVH& bvh)
 {
+    std::lock_guard<std::mutex> lock(g_bvh_descriptors_mutex);
     const auto& iter = g_bvh_descriptors.find(id);
     if (iter == g_bvh_descriptors.end())
         return false;
@@ -764,12 +776,21 @@ bool bvh_get_descriptor(uint64_t id, BVH& bvh)
     return true;
 }
 
-void bvh_add_descriptor(uint64_t id, const BVH& bvh) { g_bvh_descriptors[id] = bvh; }
+void bvh_add_descriptor(uint64_t id, const BVH& bvh)
+{
+    std::lock_guard<std::mutex> lock(g_bvh_descriptors_mutex);
+    g_bvh_descriptors[id] = bvh;
+}
 
-void bvh_rem_descriptor(uint64_t id) { g_bvh_descriptors.erase(id); }
+void bvh_rem_descriptor(uint64_t id)
+{
+    std::lock_guard<std::mutex> lock(g_bvh_descriptors_mutex);
+    g_bvh_descriptors.erase(id);
+}
 
 bool cubql_bvh_get_descriptor(uint64_t id, CuBQLBVH& bvh)
 {
+    std::lock_guard<std::mutex> lock(g_cubql_bvh_descriptors_mutex);
     const auto& iter = g_cubql_bvh_descriptors.find(id);
     if (iter == g_cubql_bvh_descriptors.end())
         return false;
@@ -778,9 +799,17 @@ bool cubql_bvh_get_descriptor(uint64_t id, CuBQLBVH& bvh)
     return true;
 }
 
-void cubql_bvh_add_descriptor(uint64_t id, const CuBQLBVH& bvh) { g_cubql_bvh_descriptors[id] = bvh; }
+void cubql_bvh_add_descriptor(uint64_t id, const CuBQLBVH& bvh)
+{
+    std::lock_guard<std::mutex> lock(g_cubql_bvh_descriptors_mutex);
+    g_cubql_bvh_descriptors[id] = bvh;
+}
 
-void cubql_bvh_rem_descriptor(uint64_t id) { g_cubql_bvh_descriptors.erase(id); }
+void cubql_bvh_rem_descriptor(uint64_t id)
+{
+    std::lock_guard<std::mutex> lock(g_cubql_bvh_descriptors_mutex);
+    g_cubql_bvh_descriptors.erase(id);
+}
 
 #ifndef WP_DISABLE_CUBQL
 
@@ -1035,6 +1064,7 @@ uint64_t wp_bvh_create_device(
 }
 void wp_bvh_refit_device(uint64_t id) { }
 void wp_bvh_destroy_device(uint64_t id) { }
+void wp_bvh_destroy_device_async(uint64_t id, void* stream) { }
 void wp_bvh_rebuild_device(uint64_t id) { }
 
 uint64_t wp_cubql_bvh_create_device(void* context, wp::vec3* lowers, wp::vec3* uppers, int num_items, int leaf_size)

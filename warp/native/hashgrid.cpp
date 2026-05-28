@@ -9,6 +9,7 @@
 #include "string.h"
 
 #include <cstddef>
+#include <mutex>
 
 using namespace wp;
 
@@ -40,6 +41,22 @@ std::map<uint64_t, HashGrid> g_hash_grid_descriptors_f;
 std::map<uint64_t, HashGridH> g_hash_grid_descriptors_h;
 std::map<uint64_t, HashGridD> g_hash_grid_descriptors_d;
 
+// Protects the three descriptor maps from concurrent mutation by Python
+// host threads.  std::map insert/erase rebalances the tree and would
+// otherwise race a concurrent hash_grid_get_descriptor reader, surfacing
+// as garbage pointer values in the destroy path (cudaErrorInvalidValue
+// from cudaFreeAsync).  Mirrors the wp.Bvh pattern in bvh.cpp.
+std::mutex g_hash_grid_descriptors_mutex;
+
+// Serialises hash_grid_update_device_impl across host threads so that
+// the static HashGrid_t<Type> staging variable inside it (kept static
+// for CUDA-graph-capture stability of the wp_memcpy_h2d source pointer)
+// is not clobbered by another thread mid-update.  Distinct from
+// g_hash_grid_descriptors_mutex to avoid deadlock with the descriptor-
+// map mutex taken inside hash_grid_reserve_device_impl /
+// hash_grid_add_descriptor.
+std::mutex g_hash_grid_update_mutex;
+
 }  // anonymous namespace
 
 
@@ -56,6 +73,7 @@ template <> std::map<uint64_t, HashGridD>& get_descriptor_map<double>() { return
 
 template <typename Type> bool hash_grid_get_descriptor(uint64_t id, HashGrid_t<Type>& grid)
 {
+    std::lock_guard<std::mutex> lock(g_hash_grid_descriptors_mutex);
     auto& descriptors = get_descriptor_map<Type>();
     const auto& iter = descriptors.find(id);
     if (iter == descriptors.end())
@@ -67,12 +85,14 @@ template <typename Type> bool hash_grid_get_descriptor(uint64_t id, HashGrid_t<T
 
 template <typename Type> void hash_grid_add_descriptor(uint64_t id, const HashGrid_t<Type>& grid)
 {
+    std::lock_guard<std::mutex> lock(g_hash_grid_descriptors_mutex);
     auto& descriptors = get_descriptor_map<Type>();
     descriptors[id] = grid;
 }
 
 template <typename Type> void hash_grid_rem_descriptor(uint64_t id)
 {
+    std::lock_guard<std::mutex> lock(g_hash_grid_descriptors_mutex);
     auto& descriptors = get_descriptor_map<Type>();
     descriptors.erase(id);
 }
@@ -243,6 +263,33 @@ template <typename Type> void hash_grid_destroy_device_impl(uint64_t id)
     }
 }
 
+// Same as hash_grid_destroy_device_impl, but routes every cudaFreeAsync
+// onto the caller-supplied `stream` instead of the current host
+// thread's stream.  Used by Python's HashGrid.__del__ after arranging
+// for `stream` to wait on every recorded usage event of the grid -- the
+// mempool's stream-ordering keeps the freed memory reserved until every
+// kernel that read the grid has actually retired, without any host-side
+// cuEventSynchronize block.
+template <typename Type> void hash_grid_destroy_device_async_impl(uint64_t id, void* stream)
+{
+    HashGrid_t<Type> grid;
+    if (hash_grid_get_descriptor(id, grid)) {
+        ContextGuard guard(grid.context);
+
+        wp_free_device_on_stream(WP_CURRENT_CONTEXT, grid.point_ids, stream);
+        wp_free_device_on_stream(WP_CURRENT_CONTEXT, grid.point_cells, stream);
+        wp_free_device_on_stream(WP_CURRENT_CONTEXT, grid.cell_starts, stream);
+        wp_free_device_on_stream(WP_CURRENT_CONTEXT, grid.cell_ends, stream);
+
+        // Free the descriptor itself on the same stream so it stays
+        // alive on the GPU until the buffers it described are also
+        // freed.
+        wp_free_device_on_stream(WP_CURRENT_CONTEXT, (HashGrid_t<Type>*)id, stream);
+
+        hash_grid_rem_descriptor<Type>(id);
+    }
+}
+
 
 template <typename Type> void hash_grid_reserve_device_impl(uint64_t id, int num_points)
 {
@@ -290,6 +337,15 @@ void hash_grid_update_device_impl(uint64_t id, Type cell_width, const wp::array_
     }
 
     int num_points = points->shape[0];
+
+    // Serialise across host threads so the static `grid` staging
+    // variable below cannot be clobbered by a concurrent build() on a
+    // different grid of the same dtype (which would memcpy the wrong
+    // pointer set into this grid's GPU descriptor and host map, then
+    // surface as cudaErrorInvalidValue in the destroy path).  Taken
+    // before hash_grid_reserve_device_impl so reserve's own descriptor
+    // mutations are also covered by the same serialisation window.
+    std::lock_guard<std::mutex> update_lock(g_hash_grid_update_mutex);
 
     // ensure we have enough memory reserved for update
     // this must be done before retrieving the descriptor
@@ -420,6 +476,28 @@ void wp_hash_grid_destroy_device(uint64_t id, int type)
         break;
     case HASH_GRID_TYPE_FLOAT64:
         hash_grid_destroy_device_impl<double>(id);
+        break;
+    default:
+        fprintf(stderr, "Warp error: Invalid hash grid type %d\n", type);
+    }
+}
+
+// Stream-ordered destroy.  See hash_grid_destroy_device_async_impl()
+// above for motivation -- Python's HashGrid.__del__ calls this after
+// arranging for `stream` to wait on every kernel that used the grid,
+// so freeing the per-grid GPU memory on `stream` is race-free without
+// a host block.
+void wp_hash_grid_destroy_device_async(uint64_t id, int type, void* stream)
+{
+    switch (type) {
+    case HASH_GRID_TYPE_FLOAT16:
+        hash_grid_destroy_device_async_impl<half>(id, stream);
+        break;
+    case HASH_GRID_TYPE_FLOAT32:
+        hash_grid_destroy_device_async_impl<float>(id, stream);
+        break;
+    case HASH_GRID_TYPE_FLOAT64:
+        hash_grid_destroy_device_async_impl<double>(id, stream);
         break;
     default:
         fprintf(stderr, "Warp error: Invalid hash grid type %d\n", type);

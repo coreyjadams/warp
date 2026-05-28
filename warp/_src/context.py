@@ -4791,6 +4791,8 @@ class Runtime:
             self.core.wp_free_device_default.restype = None
             self.core.wp_free_device_async.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
             self.core.wp_free_device_async.restype = None
+            self.core.wp_free_device_on_stream.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
+            self.core.wp_free_device_on_stream.restype = None
 
             self.core.wp_alloc_tracker_enable.argtypes = [ctypes.c_int]
             self.core.wp_alloc_tracker_enable.restype = None
@@ -5207,6 +5209,8 @@ class Runtime:
 
             self.core.wp_bvh_destroy_host.argtypes = [ctypes.c_uint64]
             self.core.wp_bvh_destroy_device.argtypes = [ctypes.c_uint64]
+            self.core.wp_bvh_destroy_device_async.argtypes = [ctypes.c_uint64, ctypes.c_void_p]
+            self.core.wp_bvh_destroy_device_async.restype = None
 
             self.core.wp_bvh_refit_host.argtypes = [ctypes.c_uint64]
             self.core.wp_bvh_rebuild_host.argtypes = [ctypes.c_uint64, ctypes.c_int]
@@ -5242,6 +5246,8 @@ class Runtime:
 
             self.core.wp_mesh_destroy_host.argtypes = [ctypes.c_uint64]
             self.core.wp_mesh_destroy_device.argtypes = [ctypes.c_uint64]
+            self.core.wp_mesh_destroy_device_async.argtypes = [ctypes.c_uint64, ctypes.c_void_p]
+            self.core.wp_mesh_destroy_device_async.restype = None
 
             self.core.wp_mesh_refit_host.argtypes = [ctypes.c_uint64]
             self.core.wp_mesh_refit_host.restype = None
@@ -5277,6 +5283,12 @@ class Runtime:
             ]
             self.core.wp_hash_grid_create_device.restype = ctypes.c_uint64
             self.core.wp_hash_grid_destroy_device.argtypes = [ctypes.c_uint64, ctypes.c_int]
+            self.core.wp_hash_grid_destroy_device_async.argtypes = [
+                ctypes.c_uint64,
+                ctypes.c_int,
+                ctypes.c_void_p,
+            ]
+            self.core.wp_hash_grid_destroy_device_async.restype = None
             self.core.wp_hash_grid_update_device.argtypes = [
                 ctypes.c_uint64,
                 ctypes.c_int,

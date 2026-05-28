@@ -26,6 +26,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <iterator>
 #include <list>
 #include <map>
@@ -175,6 +176,12 @@ struct ContextInfo {
 struct FreeInfo {
     void* context = NULL;
     void* ptr = NULL;
+    // Stream the free was originally requested on.  Captured at defer time
+    // (see deferred_free) so that the eventual cudaFreeAsync runs on the
+    // same stream that the deallocated pointer was last used on, even if
+    // the current host thread is on a different stream by the time
+    // free_deferred_allocs() drains the queue.
+    CUstream stream = NULL;
     bool is_async = false;
 };
 
@@ -189,6 +196,15 @@ struct CaptureInfo {
 struct StreamInfo {
     CUevent cached_event = NULL;  // event used for stream synchronization (cached to avoid creating temporary events)
     CaptureInfo* capture = NULL;  // capture info (only if started on this stream)
+    // Number of live wp::Stream wrappers referencing this CUstream. Multiple
+    // wrappers can share one external stream -- e.g. several worker threads
+    // each calling wp.stream_from_torch() on the same Torch stream -- so we
+    // refcount to keep cached_event alive until the last wrapper goes away.
+    //
+    // wp_cuda_stream_register increments; wp_cuda_stream_unregister
+    // decrements and only tears down cached_event / removes the g_streams
+    // entry when the count hits zero.
+    uint32_t refcount = 0;
 };
 
 // Extra resources tied to a graph, freed after the graph is released by CUDA.
@@ -261,6 +277,20 @@ static thread_local std::unordered_map<CUcontext, CUstream> tl_streams;
 // Memory allocated during graph capture requires special handling.
 // See wp_alloc_device_async() and wp_free_device_async().
 static std::unordered_map<void*, GraphAllocInfo> g_graph_allocs;
+
+// Protects g_captures and g_graph_allocs from concurrent access. Without
+// the mutex, a rehash during insert/erase would invalidate iterators held
+// by concurrent readers.
+//
+// The two atomics below are a fast path: when no graph capture is active
+// and no graph allocations are live, callers can skip the mutex entirely.
+// To make that safe, writers increment the atomic *before* inserting and
+// decrement *after* erasing (both while holding the mutex). So if a
+// reader sees zero, the map is definitely empty; if it sees non-zero, it
+// might be stale but only pays for an unnecessary lock acquisition.
+static std::mutex g_graph_state_mutex;
+static std::atomic<size_t> g_active_capture_count{0};
+static std::atomic<size_t> g_active_graph_alloc_count{0};
 
 // Memory that cannot be freed immediately gets queued here.
 // Call free_deferred_allocs() to release.
@@ -423,24 +453,56 @@ static ContextInfo* get_context_info(CUcontext ctx)
 
 static inline ContextInfo* get_context_info(void* context) { return get_context_info(static_cast<CUcontext>(context)); }
 
-static inline StreamInfo* get_stream_info(CUstream stream)
+// Look up a stream's bookkeeping info.  Returns a snapshot by value so the
+// caller can use the result without holding g_streams_mutex; previously this
+// returned a pointer into g_streams, which could dangle if another thread
+// unregistered the stream between the lookup and the dereference.  `valid`
+// is false when the stream is unknown.
+struct StreamInfoSnapshot {
+    bool valid = false;
+    CUevent cached_event = NULL;
+    CaptureInfo* capture = NULL;
+};
+
+static inline StreamInfoSnapshot get_stream_info(CUstream stream)
 {
     std::lock_guard<std::mutex> lock(g_streams_mutex);
     auto it = g_streams.find(stream);
-    if (it != g_streams.end())
-        return &it->second;
-    else
+    if (it == g_streams.end())
+        return StreamInfoSnapshot{};
+    return StreamInfoSnapshot{ true, it->second.cached_event, it->second.capture };
+}
+
+// Atomically assign a new capture pointer to a stream's StreamInfo and return
+// the previous value.  Returns NULL and sets *known to false if the stream
+// is unknown.  Used by graph begin/end capture to swap the capture pointer
+// without holding a dangling reference into g_streams.
+static inline CaptureInfo* exchange_stream_capture(CUstream stream, CaptureInfo* new_capture, bool* known = nullptr)
+{
+    std::lock_guard<std::mutex> lock(g_streams_mutex);
+    auto it = g_streams.find(stream);
+    if (it == g_streams.end()) {
+        if (known) *known = false;
         return NULL;
+    }
+    if (known) *known = true;
+    CaptureInfo* prev = it->second.capture;
+    it->second.capture = new_capture;
+    return prev;
 }
 
 static inline CaptureInfo* get_capture_info(CUstream stream)
 {
-    if (!g_captures.empty() && wp_cuda_stream_is_capturing(stream)) {
-        uint64_t capture_id = get_capture_id(stream);
-        auto capture_iter = g_captures.find(capture_id);
-        if (capture_iter != g_captures.end())
-            return capture_iter->second;
-    }
+    // Fast-path: avoid the mutex if no capture has been registered.
+    if (g_active_capture_count.load(std::memory_order_acquire) == 0)
+        return NULL;
+    if (!wp_cuda_stream_is_capturing(stream))
+        return NULL;
+    uint64_t capture_id = get_capture_id(stream);
+    std::lock_guard<std::mutex> lock(g_graph_state_mutex);
+    auto capture_iter = g_captures.find(capture_id);
+    if (capture_iter != g_captures.end())
+        return capture_iter->second;
     return NULL;
 }
 
@@ -547,13 +609,19 @@ static void deferred_free(void* ptr, void* context, bool is_async)
     FreeInfo free_info;
     free_info.ptr = ptr;
     free_info.context = context ? context : get_current_context();
+    // Capture the current stream now, while we still know which stream the
+    // caller's just-completed work was on.  When the deferred queue is
+    // drained later (free_deferred_allocs), the host thread may be on a
+    // different stream and freeing on NULL would race producers on
+    // non-blocking external streams (e.g. Torch).
+    free_info.stream = is_async ? get_current_stream(free_info.context) : NULL;
     free_info.is_async = is_async;
     g_deferred_free_list.push_back(free_info);
 }
 
 static int free_deferred_allocs(void* context = NULL)
 {
-    if (g_deferred_free_list.empty() || !g_captures.empty())
+    if (g_deferred_free_list.empty() || g_active_capture_count.load(std::memory_order_acquire) != 0)
         return 0;
 
     int num_freed_allocs = 0;
@@ -565,8 +633,12 @@ static int free_deferred_allocs(void* context = NULL)
             ContextGuard guard(free_info.context);
 
             if (free_info.is_async) {
-                // this could be a regular stream-ordered allocation or a graph allocation
-                cudaError_t res = cudaFreeAsync(free_info.ptr, NULL);
+                // this could be a regular stream-ordered allocation or a graph allocation.
+                // Free on the stream the allocation was last used on (captured in
+                // deferred_free); freeing on NULL would not synchronize with non-blocking
+                // external streams and could let the mempool hand the memory to another
+                // host thread while a kernel is still reading it.
+                cudaError_t res = cudaFreeAsync(free_info.ptr, free_info.stream);
                 if (res != cudaSuccess) {
                     if (res == cudaErrorInvalidValue) {
                         // This can happen if we try to release the pointer but the graph was
@@ -595,7 +667,7 @@ static int free_deferred_allocs(void* context = NULL)
 
 static int unload_deferred_modules(void* context = NULL)
 {
-    if (g_deferred_module_list.empty() || !g_captures.empty())
+    if (g_deferred_module_list.empty() || g_active_capture_count.load(std::memory_order_acquire) != 0)
         return 0;
 
     int num_unloaded_modules = 0;
@@ -616,7 +688,7 @@ static int unload_deferred_modules(void* context = NULL)
 
 static int destroy_deferred_graphs(void* context = NULL)
 {
-    if (g_deferred_graph_list.empty() || !g_captures.empty())
+    if (g_deferred_graph_list.empty() || g_active_capture_count.load(std::memory_order_acquire) != 0)
         return 0;
 
     int num_destroyed_graphs = 0;
@@ -651,15 +723,27 @@ static int process_deferred_graph_destroy_callbacks(void* context = NULL)
         if (graph_info->context == context || !context) {
             // handle unfreed graph allocations (may have outstanding user references)
             for (void* ptr : graph_info->unfreed_allocs) {
-                auto alloc_iter = g_graph_allocs.find(ptr);
-                if (alloc_iter != g_graph_allocs.end()) {
-                    // unlink this allocation from the destroyed graph
-                    // and free it if no user reference remains
-                    GraphAllocInfo& alloc_info = alloc_iter->second;
-                    alloc_info.graph_destroyed = true;
-                    if (!alloc_info.ref_exists) {
-                        wp_free_device_async(alloc_info.context, ptr);
+                // Examine and mutate the alloc entry under the lock, then drop
+                // the lock before calling wp_free_device_async (which takes
+                // g_graph_state_mutex itself and would otherwise deadlock).
+                void* free_context = NULL;
+                bool needs_free = false;
+                {
+                    std::lock_guard<std::mutex> lock(g_graph_state_mutex);
+                    auto alloc_iter = g_graph_allocs.find(ptr);
+                    if (alloc_iter != g_graph_allocs.end()) {
+                        // unlink this allocation from the destroyed graph
+                        // and free it if no user reference remains
+                        GraphAllocInfo& alloc_info = alloc_iter->second;
+                        alloc_info.graph_destroyed = true;
+                        if (!alloc_info.ref_exists) {
+                            needs_free = true;
+                            free_context = alloc_info.context;
+                        }
                     }
+                }
+                if (needs_free) {
+                    wp_free_device_async(free_context, ptr);
                 }
             }
 
@@ -769,6 +853,61 @@ void wp_free_device(void* context, void* ptr)
         wp_free_device_default(context, ptr);
 }
 
+// Free a device pointer on an explicit caller-supplied stream.
+//
+// Use this when the caller knows the exact stream that the kernels using
+// `ptr` were launched on (e.g. when an object's destructor is given the
+// stream the object was recorded on via Mesh.record_stream / Bvh.record_stream).
+// The free is stream-ordered against any prior work on `stream`, so kernels
+// that consumed `ptr` are guaranteed to complete before the mempool can
+// reuse the underlying memory.
+//
+// Falls back to the device's default-allocator path when mempools are not
+// supported on this device, in which case `stream` is ignored (cudaFree is
+// a host-synchronous free).
+void wp_free_device_on_stream(void* context, void* ptr, void* stream)
+{
+    int ordinal = wp_cuda_context_get_device_ordinal(context);
+
+    if (!wp_cuda_device_is_mempool_supported(ordinal)) {
+        wp_free_device_default(context, ptr);
+        return;
+    }
+
+    if (g_alloc_tracker.enabled && ptr)
+        g_alloc_tracker.record_free(ptr);
+
+    ContextGuard guard(context);
+
+    // Defer mempool frees while a graph capture is ongoing -- the existing
+    // deferred-free queue knows how to replay them safely after capture
+    // ends, and we don't have a clean way to record a free on an arbitrary
+    // stream from inside capture.
+    if (g_active_capture_count.load(std::memory_order_acquire) != 0) {
+        deferred_free(ptr, context, true);
+        return;
+    }
+
+    // If this allocation came from a graph capture, the main async-free path
+    // has dedicated bookkeeping for it.  Route through wp_free_device_async
+    // (which now also frees on the current stream); we lose the caller's
+    // hint about `stream` but graph-allocated pointers are bound to the
+    // capture's stream regardless.
+    if (g_active_graph_alloc_count.load(std::memory_order_acquire) != 0) {
+        bool is_graph_alloc = false;
+        {
+            std::lock_guard<std::mutex> lock(g_graph_state_mutex);
+            is_graph_alloc = g_graph_allocs.find(ptr) != g_graph_allocs.end();
+        }
+        if (is_graph_alloc) {
+            wp_free_device_async(context, ptr);
+            return;
+        }
+    }
+
+    check_cuda(cudaFreeAsync(ptr, static_cast<CUstream>(stream)));
+}
+
 void* wp_alloc_device_default(void* context, size_t s, const char* tag)
 {
     ContextGuard guard(context);
@@ -789,7 +928,7 @@ void wp_free_device_default(void* context, void* ptr)
     ContextGuard guard(context);
 
     // check if a capture is in progress
-    if (g_captures.empty()) {
+    if (g_active_capture_count.load(std::memory_order_acquire) == 0) {
         check_cuda(cudaFree(ptr));
     } else {
         // we must defer the operation until graph captures complete
@@ -809,12 +948,20 @@ void* wp_alloc_device_async(void* context, size_t s, const char* tag)
     check_cuda(cudaMallocAsync(&ptr, s, stream));
 
     if (ptr) {
-        // if the stream is capturing, the allocation requires special handling
-        if (wp_cuda_stream_is_capturing(stream)) {
+        // if the stream is capturing, the allocation requires special handling.
+        // Check the cheap atomic first so the no-capture fast path skips the
+        // cuStreamIsCapturing driver call (which would otherwise run on every
+        // device allocation).
+        if (g_active_capture_count.load(std::memory_order_acquire) != 0
+            && wp_cuda_stream_is_capturing(stream)) {
             // check if this is a known capture
             uint64_t capture_id = get_capture_id(stream);
-            auto capture_iter = g_captures.find(capture_id);
-            if (capture_iter != g_captures.end()) {
+            bool capture_known = false;
+            {
+                std::lock_guard<std::mutex> lock(g_graph_state_mutex);
+                capture_known = g_captures.find(capture_id) != g_captures.end();
+            }
+            if (capture_known) {
                 // remember graph allocation details
                 GraphAllocInfo alloc_info;
                 alloc_info.capture_id = capture_id;
@@ -847,7 +994,11 @@ void* wp_alloc_device_async(void* context, size_t s, const char* tag)
                     fprintf(stderr, "Warp warning: %s: failed to find memory allocation node\n", __FUNCTION__);
                 }
 
-                g_graph_allocs[ptr] = alloc_info;
+                {
+                    std::lock_guard<std::mutex> lock(g_graph_state_mutex);
+                    g_active_graph_alloc_count.fetch_add(1, std::memory_order_release);
+                    g_graph_allocs[ptr] = alloc_info;
+                }
             }
         }
     }
@@ -872,16 +1023,50 @@ void wp_free_device_async(void* context, void* ptr, void** dbg_node_ret)
     // completes before releasing the memory.  The strategy is different for regular stream-ordered allocations
     // and allocations made during graph capture.  See below for details.
 
+    // Fast path: when nothing graph-related is in flight we don't need to
+    // touch g_graph_allocs / g_captures at all.  The atomics are written
+    // *before* any insert into either map (under g_graph_state_mutex), so
+    // observing both at zero with acquire ordering guarantees neither map
+    // has a relevant entry.  See the data-section comment above for the
+    // ordering argument.
+    if (g_active_graph_alloc_count.load(std::memory_order_acquire) == 0
+        && g_active_capture_count.load(std::memory_order_acquire) == 0) {
+        check_cuda(cudaFreeAsync(ptr, get_current_stream(context)));
+        return;
+    }
+
+    // Slow path: graph capture or graph allocations may be in flight.
+    // Hold g_graph_state_mutex across the whole body so the lookups and
+    // erases on the two maps stay coherent.  This serializes graph-related
+    // frees globally, but is gated by the fast-path check above so it does
+    // not affect the common non-capture workload.
+    std::lock_guard<std::mutex> lock(g_graph_state_mutex);
+
     // check if this allocation was made during graph capture
     auto alloc_iter = g_graph_allocs.find(ptr);
     if (alloc_iter == g_graph_allocs.end()) {
         // Not a graph allocation.
         // Check if graph capture is ongoing.
         if (g_captures.empty()) {
-            // cudaFreeAsync on the null stream does not block or trigger synchronization, but it postpones
-            // the deallocation until a synchronization point is reached, so preceding work on this pointer
-            // should safely complete.
-            check_cuda(cudaFreeAsync(ptr, NULL));
+            // Free on the current host thread's stream rather than the legacy null stream.
+            //
+            // wp_alloc_device_async already issues cudaMallocAsync on this same
+            // stream, so the matching cudaFreeAsync here puts the free in
+            // stream-order with the kernels that produced/consumed the pointer.
+            // CUDA's mempool driver propagates this ordering to subsequent
+            // cudaMallocAsync calls on other streams (it inserts an implicit
+            // stream-wait when handing out reused memory), which keeps multiple
+            // host threads sharing the same pool race-free.
+            //
+            // Freeing on NULL only works correctly when every stream that ever
+            // touched the pointer is a legacy/blocking stream that synchronizes
+            // with the null stream.  Torch creates streams with
+            // cudaStreamNonBlocking, so the null stream does NOT synchronize
+            // with them and the mempool will happily hand the just-freed
+            // memory to another host thread while a kernel is still reading
+            // it, surfacing as cudaErrorIllegalAddress (700) on the next
+            // event sync / kernel launch.
+            check_cuda(cudaFreeAsync(ptr, get_current_stream(context)));
         } else {
             // We must defer the free operation until graph capture completes.
             deferred_free(ptr, context, true);
@@ -899,6 +1084,7 @@ void wp_free_device_async(void* context, void* ptr, void** dbg_node_ret)
             if (!graph) {
                 fprintf(stderr, "Warp warning: %s: failed to get capture graph\n", __FUNCTION__);
                 g_graph_allocs.erase(alloc_iter);
+                g_active_graph_alloc_count.fetch_sub(1, std::memory_order_release);
                 return;
             }
 
@@ -910,6 +1096,7 @@ void wp_free_device_async(void* context, void* ptr, void** dbg_node_ret)
                 if (!get_dependent_leaf_nodes(alloc_info.node, alloc_leaf_nodes)) {
                     fprintf(stderr, "Warp warning: %s: failed to get allocation-dependent nodes\n", __FUNCTION__);
                     g_graph_allocs.erase(alloc_iter);
+                    g_active_graph_alloc_count.fetch_sub(1, std::memory_order_release);
                     return;
                 }
 
@@ -922,6 +1109,7 @@ void wp_free_device_async(void* context, void* ptr, void** dbg_node_ret)
                     ))) {
                     fprintf(stderr, "Warp warning: %s: failed to add a memory free node\n", __FUNCTION__);
                     g_graph_allocs.erase(alloc_iter);
+                    g_active_graph_alloc_count.fetch_sub(1, std::memory_order_release);
                     return;
                 }
 
@@ -997,13 +1185,17 @@ void wp_free_device_async(void* context, void* ptr, void** dbg_node_ret)
 
             // we're done with this allocation, it's owned by the graph
             g_graph_allocs.erase(alloc_iter);
+            g_active_graph_alloc_count.fetch_sub(1, std::memory_order_release);
         } else {
             // the capture has ended
             // if the owning graph was already destroyed, we can free the pointer now
             if (alloc_info.graph_destroyed) {
+                // Already holding g_graph_state_mutex; .empty() on g_captures is safe.
                 if (g_captures.empty()) {
-                    // try to free the pointer now
-                    cudaError_t res = cudaFreeAsync(ptr, NULL);
+                    // try to free the pointer now, on the current host thread's
+                    // stream so the mempool can stream-order reuse correctly
+                    // (see the comment in the non-capture path above).
+                    cudaError_t res = cudaFreeAsync(ptr, get_current_stream(context));
                     if (res == cudaErrorInvalidValue) {
                         // This can happen if we try to release the pointer but the graph was
                         // never launched, so the memory isn't mapped.
@@ -1020,6 +1212,7 @@ void wp_free_device_async(void* context, void* ptr, void** dbg_node_ret)
 
                 // we're done with this allocation
                 g_graph_allocs.erase(alloc_iter);
+                g_active_graph_alloc_count.fetch_sub(1, std::memory_order_release);
             } else {
                 // graph still exists
                 // unreference the pointer so it will be deallocated once the graph instance is destroyed
@@ -1178,10 +1371,14 @@ bool wp_memcpy_p2p(void* dst_context, void* dst, void* src_context, void* src, s
                 cuPointerGetAttribute_f(&dst_mempool, CU_POINTER_ATTRIBUTE_MEMPOOL_HANDLE, (CUdeviceptr)dst);
                 cudaGetLastError();  // clear any errors
                 // check if either of the pointers was allocated during graph capture
-                auto src_alloc = g_graph_allocs.find(src);
-                auto dst_alloc = g_graph_allocs.find(dst);
-                if (src_mempool != NULL || src_alloc != g_graph_allocs.end() || dst_mempool != NULL
-                    || dst_alloc != g_graph_allocs.end()) {
+                bool src_is_graph_alloc = false;
+                bool dst_is_graph_alloc = false;
+                if (g_active_graph_alloc_count.load(std::memory_order_acquire) != 0) {
+                    std::lock_guard<std::mutex> lock(g_graph_state_mutex);
+                    src_is_graph_alloc = g_graph_allocs.find(src) != g_graph_allocs.end();
+                    dst_is_graph_alloc = g_graph_allocs.find(dst) != g_graph_allocs.end();
+                }
+                if (src_mempool != NULL || src_is_graph_alloc || dst_mempool != NULL || dst_is_graph_alloc) {
                     wp::append_error_string(
                         "*** CUDA mempool allocations were used in a peer-to-peer copy during graph capture."
                     );
@@ -2826,11 +3023,10 @@ void wp_cuda_context_set_stream(void* context, void* stream, int sync)
     if (sync && ctx) {
         CUstream old_stream = static_cast<CUstream>(wp_cuda_context_get_stream(ctx));
         if (old_stream && old_stream != new_stream) {
-            StreamInfo* old_stream_info = get_stream_info(old_stream);
-            if (old_stream_info) {
-                CUevent cached_event = old_stream_info->cached_event;
-                check_cu(cuEventRecord_f(cached_event, old_stream));
-                check_cu(cuStreamWaitEvent_f(new_stream, cached_event, CU_EVENT_WAIT_DEFAULT));
+            StreamInfoSnapshot old_stream_info = get_stream_info(old_stream);
+            if (old_stream_info.valid && old_stream_info.cached_event) {
+                check_cu(cuEventRecord_f(old_stream_info.cached_event, old_stream));
+                check_cu(cuStreamWaitEvent_f(new_stream, old_stream_info.cached_event, CU_EVENT_WAIT_DEFAULT));
             }
         }
     }
@@ -3135,10 +3331,18 @@ void wp_cuda_stream_register(void* context, void* stream)
 
     ContextGuard guard(context);
 
-    // populate stream info
+    // Refcounted register: if this CUstream is already in g_streams (because
+    // another wp::Stream wrapper is already live on it), just bump the
+    // refcount and reuse the existing cached_event.  Creating a fresh event
+    // here would leak the previous one and would race anyone currently
+    // reading it.
     std::lock_guard<std::mutex> lock(g_streams_mutex);
-    StreamInfo& stream_info = g_streams[static_cast<CUstream>(stream)];
-    check_cu(cuEventCreate_f(&stream_info.cached_event, CU_EVENT_DISABLE_TIMING));
+    auto [it, inserted] = g_streams.emplace(static_cast<CUstream>(stream), StreamInfo{});
+    StreamInfo& stream_info = it->second;
+    if (inserted) {
+        check_cu(cuEventCreate_f(&stream_info.cached_event, CU_EVENT_DISABLE_TIMING));
+    }
+    ++stream_info.refcount;
 }
 
 void wp_cuda_stream_unregister(void* context, void* stream)
@@ -3148,14 +3352,28 @@ void wp_cuda_stream_unregister(void* context, void* stream)
 
     CUstream cuda_stream = static_cast<CUstream>(stream);
 
+    // Refcounted unregister: only destroy cached_event and erase the
+    // g_streams entry when the last wp::Stream wrapper releases this
+    // CUstream.  Otherwise we'd pull the cached_event out from under any
+    // wrapper still referencing the stream.
+    bool last_ref = false;
     {
         std::lock_guard<std::mutex> lock(g_streams_mutex);
         auto it = g_streams.find(cuda_stream);
         if (it != g_streams.end()) {
-            check_cu(cuEventDestroy_f(it->second.cached_event));
-            g_streams.erase(it);
+            if (it->second.refcount > 0) {
+                --it->second.refcount;
+            }
+            if (it->second.refcount == 0) {
+                check_cu(cuEventDestroy_f(it->second.cached_event));
+                g_streams.erase(it);
+                last_ref = true;
+            }
         }
     }
+
+    if (!last_ref)
+        return;
 
     // make sure we don't leave dangling references to this stream
     ContextInfo* context_info = get_context_info(context);
@@ -3179,7 +3397,8 @@ void wp_cuda_stream_synchronize(void* stream) { check_cu(cuStreamSynchronize_f(s
 void wp_cuda_stream_wait_event(void* stream, void* event, bool external)
 {
     // the external flag can only be used during graph capture
-    if (external && !g_captures.empty() && wp_cuda_stream_is_capturing(stream)) {
+    if (external && g_active_capture_count.load(std::memory_order_acquire) != 0
+        && wp_cuda_stream_is_capturing(stream)) {
         // wait for an external event during graph capture
         check_cu(
             cuStreamWaitEvent_f(static_cast<CUstream>(stream), static_cast<CUevent>(event), CU_EVENT_WAIT_EXTERNAL)
@@ -3197,7 +3416,7 @@ void wp_cuda_stream_wait_stream(void* stream, void* other_stream, void* event, b
     unsigned wait_flags = CU_EVENT_WAIT_DEFAULT;
 
     // the external flag can only be used during graph capture
-    if (external && !g_captures.empty()) {
+    if (external && g_active_capture_count.load(std::memory_order_acquire) != 0) {
         if (wp_cuda_stream_is_capturing(other_stream))
             record_flags = CU_EVENT_RECORD_EXTERNAL;
         if (wp_cuda_stream_is_capturing(stream))
@@ -3254,7 +3473,8 @@ int wp_cuda_event_query(void* event)
 void wp_cuda_event_record(void* event, void* stream, bool external)
 {
     // the external flag can only be used during graph capture
-    if (external && !g_captures.empty() && wp_cuda_stream_is_capturing(stream)) {
+    if (external && g_active_capture_count.load(std::memory_order_acquire) != 0
+        && wp_cuda_stream_is_capturing(stream)) {
         // record external event during graph capture (e.g., for timing or when explicitly specified by the user)
         check_cu(cuEventRecordWithFlags_f(
             static_cast<CUevent>(event), static_cast<CUstream>(stream), CU_EVENT_RECORD_EXTERNAL
@@ -3280,8 +3500,7 @@ bool wp_cuda_graph_begin_capture(void* context, void* stream, int external, int 
     ContextGuard guard(context);
 
     CUstream cuda_stream = static_cast<CUstream>(stream);
-    StreamInfo* stream_info = get_stream_info(cuda_stream);
-    if (!stream_info) {
+    if (!get_stream_info(cuda_stream).valid) {
         wp::set_error_string("Warp error: unknown stream");
         return false;
     }
@@ -3324,11 +3543,25 @@ bool wp_cuda_graph_begin_capture(void* context, void* stream, int external, int 
     capture->external = bool(external);
     capture->mode = capture_mode;
 
-    // update stream info
-    stream_info->capture = capture;
+    // update stream info (still under g_streams_mutex via the helper)
+    bool stream_known = false;
+    exchange_stream_capture(cuda_stream, capture, &stream_known);
+    if (!stream_known) {
+        // racy unregister between the initial check and now
+        wp::set_error_string("Warp error: stream was unregistered during capture begin");
+        delete capture;
+        return false;
+    }
 
-    // add to known captures
-    g_captures[capture_id] = capture;
+    // add to known captures.  Bump the active-capture counter under the lock
+    // so the fast-path readers (wp_alloc_device_async, wp_free_device_async,
+    // get_capture_info, deferred_*) observe a non-zero count *before* they
+    // could possibly see this new map entry.
+    {
+        std::lock_guard<std::mutex> lock(g_graph_state_mutex);
+        g_active_capture_count.fetch_add(1, std::memory_order_release);
+        g_captures[capture_id] = capture;
+    }
 
     return true;
 }
@@ -3337,16 +3570,18 @@ bool wp_cuda_graph_end_capture(void* context, void* stream, void** graph_ret)
 {
     ContextGuard guard(context);
 
-    // check if this is a known stream
+    // check if this is a known stream and atomically take ownership of its
+    // current capture pointer (clearing it from the StreamInfo so any
+    // concurrent reader sees the capture as finished).
     CUstream cuda_stream = static_cast<CUstream>(stream);
-    StreamInfo* stream_info = get_stream_info(cuda_stream);
-    if (!stream_info) {
+    bool stream_known = false;
+    CaptureInfo* capture = exchange_stream_capture(cuda_stream, NULL, &stream_known);
+    if (!stream_known) {
         wp::set_error_string("Warp error: unknown capture stream");
         return false;
     }
 
     // check if this stream was used to start a capture
-    CaptureInfo* capture = stream_info->capture;
     if (!capture) {
         wp::set_error_string("Warp error: stream has no capture started");
         return false;
@@ -3357,18 +3592,23 @@ bool wp_cuda_graph_end_capture(void* context, void* stream, void** graph_ret)
     uint64_t capture_id = capture->id;
     std::vector<FreeInfo> tmp_allocs = capture->tmp_allocs;
 
-    // clear capture info
-    stream_info->capture = NULL;
-    g_captures.erase(capture_id);
+    {
+        std::lock_guard<std::mutex> lock(g_graph_state_mutex);
+        g_captures.erase(capture_id);
+        g_active_capture_count.fetch_sub(1, std::memory_order_release);
+    }
     delete capture;
 
     // a lambda to clean up on exit in case of error
     auto clean_up = [cuda_stream, capture_id, external]() {
         // unreference outstanding graph allocs so that they will be released with the user reference
-        for (auto it = g_graph_allocs.begin(); it != g_graph_allocs.end(); ++it) {
-            GraphAllocInfo& alloc_info = it->second;
-            if (alloc_info.capture_id == capture_id)
-                alloc_info.graph_destroyed = true;
+        {
+            std::lock_guard<std::mutex> lock(g_graph_state_mutex);
+            for (auto it = g_graph_allocs.begin(); it != g_graph_allocs.end(); ++it) {
+                GraphAllocInfo& alloc_info = it->second;
+                if (alloc_info.capture_id == capture_id)
+                    alloc_info.graph_destroyed = true;
+            }
         }
 
         // make sure we terminate the capture
@@ -3414,10 +3654,13 @@ bool wp_cuda_graph_end_capture(void* context, void* stream, void** graph_ret)
 
     // check if this graph has unfreed allocations, which require special handling
     std::vector<void*> unfreed_allocs;
-    for (auto it = g_graph_allocs.begin(); it != g_graph_allocs.end(); ++it) {
-        GraphAllocInfo& alloc_info = it->second;
-        if (alloc_info.capture_id == capture_id)
-            unfreed_allocs.push_back(it->first);
+    {
+        std::lock_guard<std::mutex> lock(g_graph_state_mutex);
+        for (auto it = g_graph_allocs.begin(); it != g_graph_allocs.end(); ++it) {
+            GraphAllocInfo& alloc_info = it->second;
+            if (alloc_info.capture_id == capture_id)
+                unfreed_allocs.push_back(it->first);
+        }
     }
 
     if (!unfreed_allocs.empty() || !tmp_allocs.empty()) {
@@ -3450,7 +3693,7 @@ bool wp_cuda_graph_end_capture(void* context, void* stream, void** graph_ret)
         return false;
 
     // process deferred free list if no more captures are ongoing
-    if (g_captures.empty()) {
+    if (g_active_capture_count.load(std::memory_order_acquire) == 0) {
         run_deferred_actions();
     }
 
@@ -3630,6 +3873,7 @@ void* wp_cuda_graph_insert_alloc_node(void* context, size_t size)
 
     // get the resulting alloc node
     if (ptr) {
+        std::lock_guard<std::mutex> lock(g_graph_state_mutex);
         auto alloc_iter = g_graph_allocs.find(ptr);
         if (alloc_iter != g_graph_allocs.end()) {
             // NOTE: Set ``ref_exists`` to false for this allocation. This ensures that
@@ -3902,12 +4146,12 @@ bool wp_cuda_graph_resume_capture(void* context, void* stream, void* graph)
     // point because the resume path is only reached after a matching pause
     // on a Warp-managed capture; if either is missing something is badly
     // out of sync, fail fast rather than guess a mode.
-    StreamInfo* stream_info = get_stream_info(cuda_stream);
-    if (!stream_info) {
+    StreamInfoSnapshot stream_info = get_stream_info(cuda_stream);
+    if (!stream_info.valid) {
         wp::set_error_string("Warp error: resume_capture called on unknown stream");
         return false;
     }
-    CaptureInfo* capture = stream_info->capture;
+    CaptureInfo* capture = stream_info.capture;
     if (!capture) {
         wp::set_error_string("Warp error: resume_capture called on stream with no active capture");
         return false;
@@ -4377,7 +4621,7 @@ bool wp_cuda_graph_launch(void* graph_exec, void* stream)
 bool wp_cuda_graph_destroy(void* context, void* graph)
 {
     // ensure there are no graph captures in progress
-    if (g_captures.empty()) {
+    if (g_active_capture_count.load(std::memory_order_acquire) == 0) {
         ContextGuard guard(context);
         return check_cuda(cudaGraphDestroy((cudaGraph_t)graph));
     } else {
@@ -4392,7 +4636,7 @@ bool wp_cuda_graph_destroy(void* context, void* graph)
 bool wp_cuda_graph_exec_destroy(void* context, void* graph_exec)
 {
     // ensure there are no graph captures in progress
-    if (g_captures.empty()) {
+    if (g_active_capture_count.load(std::memory_order_acquire) == 0) {
         ContextGuard guard(context);
         return check_cuda(cudaGraphExecDestroy((cudaGraphExec_t)graph_exec));
     } else {
@@ -5178,7 +5422,7 @@ void* wp_cuda_load_module(void* context, const char* path)
 void wp_cuda_unload_module(void* context, void* module)
 {
     // ensure there are no graph captures in progress
-    if (g_captures.empty()) {
+    if (g_active_capture_count.load(std::memory_order_acquire) == 0) {
         ContextGuard guard(context);
         check_cu(cuModuleUnload_f((CUmodule)module));
     } else {
